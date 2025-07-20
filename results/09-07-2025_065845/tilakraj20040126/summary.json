@@ -1,0 +1,22 @@
+{
+  "patient": {
+    "oid": "174840484554956",
+    "fln": "Tilak Raj",
+    "health-ids": [
+      "tilakraj20040126@abdm"
+    ],
+    "abha": "tilakraj20040126@abdm"
+  },
+  "execution": {
+    "date": "09-07-2025",
+    "time": "06:00:00",
+    "burst_count": 10,
+    "interval_ms": 100
+  },
+  "results": {
+    "total_attempts": 10,
+    "successful_attempts": 0,
+    "golden_response_attempt": 0,
+    "validation_success": false
+  }
+}

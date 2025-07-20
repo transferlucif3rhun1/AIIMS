@@ -1,0 +1,9 @@
+{
+  "attempt": 10,
+  "timestamp": "2025-07-09T06:52:08.148+05:30",
+  "response": {
+    "status": "no_response"
+  },
+  "status": "pending",
+  "response_time_ms": 80
+}

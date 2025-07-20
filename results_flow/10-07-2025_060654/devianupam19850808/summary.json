@@ -1,0 +1,25 @@
+{
+  "execution_time": "2025-07-10T06:06:57+05:30",
+  "golden_response": {
+    "token_number": "419",
+    "created_at": "2025-07-10T00:36:56Z",
+    "request_id": "1e62c902-59d6-4cec-b7db-ac7e10ef46f0",
+    "hip_id": "IN2210000099",
+    "hip_name": "All India Institute of Medical Sciences (AIIMS) Raipur",
+    "token_expiry": "2025-07-10T01:06:56Z",
+    "footer": "Proceed to the counter and get your OPD slip",
+    "show_token_screen": true,
+    "address": ""
+  },
+  "patient": {
+    "oid": "174840484514438",
+    "fln": "Anupam Devi",
+    "health-ids": [
+      "devianupam19850808@abdm"
+    ],
+    "abha": "devianupam19850808@abdm"
+  },
+  "successful": 8,
+  "total_attempts": 10,
+  "validation_success": true
+}
