@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -41,9 +42,11 @@ const (
 	TokenRefreshBuffer  = 30 * time.Minute
 	MaxRetryAttempts    = 3
 	RetryDelay          = 2 * time.Second
+	MinPhoneDigits      = 10
+	MaxPhoneDigits      = 15
 )
 
-var verificationMinutes = []int{30, 0, 30, 0}
+var verificationMinutes = []int{0, 30}
 
 type Config struct {
 	AuthToken        string `json:"auth_token"`
@@ -69,6 +72,17 @@ func (c *Config) Validate() error {
 	}
 	if c.Timezone == "" {
 		c.Timezone = DefaultTimezone
+	}
+	if _, err := time.LoadLocation(c.Timezone); err != nil {
+		return fmt.Errorf("invalid timezone '%s': %v", c.Timezone, err)
+	}
+	if c.TargetDate != "" {
+		if _, err := time.Parse("2006-01-02", c.TargetDate); err != nil {
+			return fmt.Errorf("invalid target_date format (expected YYYY-MM-DD): %v", err)
+		}
+	}
+	if c.WhatsAppEndpoint != "" && !strings.HasPrefix(c.WhatsAppEndpoint, "http") {
+		return fmt.Errorf("invalid whatsapp_endpoint: must be a valid URL")
 	}
 	return nil
 }
@@ -105,17 +119,22 @@ type ValidatedPatient struct {
 }
 
 type BurstResult struct {
-	Attempt      int             `json:"attempt"`
-	Timestamp    string          `json:"timestamp"`
-	Response     json.RawMessage `json:"response"`
-	Status       string          `json:"status"`
-	ResponseTime int64           `json:"response_time_ms"`
+	Attempt      int    `json:"attempt"`
+	Timestamp    string `json:"timestamp"`
+	Status       string `json:"status"`
+	ResponseTime int64  `json:"response_time_ms"`
+	TokenNumber  string `json:"token_number,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
-type ExecutionResult struct {
-	HealthID string        `json:"health_id"`
-	Results  []BurstResult `json:"results"`
-	Summary  interface{}   `json:"summary"`
+type PatientSummary struct {
+	Patient       Patient `json:"patient"`
+	TotalAttempts int     `json:"total_attempts"`
+	Successful    int     `json:"successful"`
+	ValidationOK  bool    `json:"validation_success"`
+	TokenNumber   string  `json:"token_number,omitempty"`
+	ExecutionTime string  `json:"execution_time"`
+	GoldenAttempt int     `json:"golden_attempt,omitempty"`
 }
 
 type VerificationResult struct {
@@ -123,13 +142,6 @@ type VerificationResult struct {
 	TokenNumber string
 	HasSuccess  bool
 	Timestamp   string
-}
-
-type WhatsAppNotification struct {
-	Patient        Patient
-	GoldenResponse json.RawMessage
-	HasSuccess     bool
-	TokenNumber    string
 }
 
 type HTTPClient interface {
@@ -151,11 +163,73 @@ type RateLimiter interface {
 	Close()
 }
 
+type ResultWriter struct {
+	baseDir   string
+	mu        sync.Mutex
+	fileCache map[string]*os.File
+}
+
+func NewResultWriter(baseDir string) (*ResultWriter, error) {
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create results directory: %v", err)
+	}
+
+	return &ResultWriter{
+		baseDir:   baseDir,
+		fileCache: make(map[string]*os.File),
+	}, nil
+}
+
+func (rw *ResultWriter) WritePatientDir(healthID string) (string, error) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	healthIDSafe := sanitizeFilename(strings.Split(healthID, "@")[0])
+	patientDir := filepath.Join(rw.baseDir, healthIDSafe)
+
+	if err := os.MkdirAll(patientDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create patient directory: %v", err)
+	}
+
+	return patientDir, nil
+}
+
+func (rw *ResultWriter) WriteBurstResult(patientDir string, result BurstResult) error {
+	if result.Status != "error" && result.Status != "mismatch" {
+		return nil
+	}
+
+	path := filepath.Join(patientDir, fmt.Sprintf("attempt_%03d.json", result.Attempt))
+	return writeJSONFile(path, result)
+}
+
+func (rw *ResultWriter) WriteSummary(patientDir string, summary PatientSummary) error {
+	path := filepath.Join(patientDir, "summary.json")
+	return writeJSONFile(path, summary)
+}
+
+func (rw *ResultWriter) WriteExecutionSummary(summary map[string]interface{}) error {
+	path := filepath.Join(rw.baseDir, "execution_summary.json")
+	return writeJSONFile(path, summary)
+}
+
+func (rw *ResultWriter) Close() {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	for _, file := range rw.fileCache {
+		file.Close()
+	}
+}
+
 type tokenBucket struct {
-	ch     chan struct{}
-	ticker *time.Ticker
-	ctx    context.Context
-	cancel context.CancelFunc
+	ch       chan struct{}
+	ticker   *time.Ticker
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	closedMu sync.Mutex
+	closed   bool
 }
 
 func NewRateLimiter(rps int, ctx context.Context) RateLimiter {
@@ -168,27 +242,35 @@ func NewRateLimiter(rps int, ctx context.Context) RateLimiter {
 
 	ticker := time.NewTicker(time.Second / time.Duration(rps))
 
+	tb := &tokenBucket{
+		ch:     ch,
+		ticker: ticker,
+		ctx:    rateLimiterCtx,
+		cancel: cancel,
+	}
+
+	tb.wg.Add(1)
 	go func() {
+		defer tb.wg.Done()
 		defer ticker.Stop()
 		for {
 			select {
 			case <-rateLimiterCtx.Done():
 				return
 			case <-ticker.C:
-				select {
-				case ch <- struct{}{}:
-				default:
+				tb.closedMu.Lock()
+				if !tb.closed {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
 				}
+				tb.closedMu.Unlock()
 			}
 		}
 	}()
 
-	return &tokenBucket{
-		ch:     ch,
-		ticker: ticker,
-		ctx:    rateLimiterCtx,
-		cancel: cancel,
-	}
+	return tb
 }
 
 func (tb *tokenBucket) Acquire() <-chan struct{} {
@@ -196,7 +278,16 @@ func (tb *tokenBucket) Acquire() <-chan struct{} {
 }
 
 func (tb *tokenBucket) Close() {
+	tb.closedMu.Lock()
+	if tb.closed {
+		tb.closedMu.Unlock()
+		return
+	}
+	tb.closed = true
+	tb.closedMu.Unlock()
+
 	tb.cancel()
+	tb.wg.Wait()
 	close(tb.ch)
 }
 
@@ -209,6 +300,10 @@ type ABDMManager struct {
 	validatedPool   []*ValidatedPatient
 	originalTokens  map[string]string
 	tokenMutex      sync.RWMutex
+	tokenMapMutex   sync.RWMutex
+	resultWriter    *ResultWriter
+	successCount    atomic.Int32
+	totalCount      atomic.Int32
 	ctx             context.Context
 	cancel          context.CancelFunc
 }
@@ -248,8 +343,8 @@ func (tm *defaultTokenManager) RefreshMasterToken() error {
 			sess, sessOk := respObj["sess"].(string)
 			refresh, refreshOk := respObj["refresh"].(string)
 
-			if !sessOk || !refreshOk {
-				lastErr = fmt.Errorf("invalid refresh response format")
+			if !sessOk || !refreshOk || sess == "" || refresh == "" {
+				lastErr = fmt.Errorf("invalid refresh response format: missing or empty sess/refresh tokens")
 				continue
 			}
 
@@ -271,7 +366,7 @@ func (tm *defaultTokenManager) RefreshMasterToken() error {
 			return nil
 		}
 
-		lastErr = fmt.Errorf("refresh attempt %d failed: status %d, error: %v", attempt, status, err)
+		lastErr = fmt.Errorf("refresh attempt %d failed [POST /phr/v3/auth/refresh]: status %d, error: %v", attempt, status, err)
 		if attempt < MaxRetryAttempts {
 			time.Sleep(RetryDelay * time.Duration(attempt))
 		}
@@ -284,7 +379,7 @@ func (tm *defaultTokenManager) GetPatientToken(patientOID string) (*Token, error
 	masterToken := tm.GetMasterToken()
 	if masterToken.IsExpired() {
 		if err := tm.RefreshMasterToken(); err != nil {
-			return nil, fmt.Errorf("failed to refresh master token: %v", err)
+			return nil, fmt.Errorf("failed to refresh master token for patient switch: %v", err)
 		}
 		masterToken = tm.GetMasterToken()
 	}
@@ -296,25 +391,31 @@ func (tm *defaultTokenManager) GetPatientToken(patientOID string) (*Token, error
 
 	body, status, err := tm.makeHTTPCall("POST", "https://aortago.eka.care/v3/auth/switch", payload)
 	if err != nil || status != 200 {
-		return nil, fmt.Errorf("patient switch failed: status %d, error: %v", status, err)
+		return nil, fmt.Errorf("patient switch failed [POST /v3/auth/switch] for OID %s: status %d, error: %v", patientOID, status, err)
 	}
 
 	var switchResponse map[string]string
 	if err := json.Unmarshal(body, &switchResponse); err != nil {
-		return nil, fmt.Errorf("failed to parse switch response: %v", err)
+		return nil, fmt.Errorf("failed to parse switch response for OID %s: %v", patientOID, err)
+	}
+
+	sess, sessOk := switchResponse["sess"]
+	refresh, refreshOk := switchResponse["refresh"]
+	if !sessOk || !refreshOk || sess == "" || refresh == "" {
+		return nil, fmt.Errorf("invalid switch response for OID %s: missing or empty sess/refresh", patientOID)
 	}
 
 	deviceID, err := generateSecureUUID()
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate device ID: %v", err)
+		return nil, fmt.Errorf("failed to generate device ID for OID %s: %v", patientOID, err)
 	}
 
 	return &Token{
-		Auth:      switchResponse["sess"],
-		Sess:      switchResponse["sess"],
-		Refresh:   switchResponse["refresh"],
+		Auth:      sess,
+		Sess:      sess,
+		Refresh:   refresh,
 		DeviceID:  deviceID,
-		ExpiresAt: parseJWTExpiry(switchResponse["sess"]),
+		ExpiresAt: parseJWTExpiry(sess),
 	}, nil
 }
 
@@ -333,7 +434,7 @@ func (tm *defaultTokenManager) makeHTTPCall(method, url string, payload interfac
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create request: %v", err)
+		return nil, 0, fmt.Errorf("failed to create request [%s %s]: %v", method, url, err)
 	}
 
 	headers := buildBaseHeaders()
@@ -347,7 +448,7 @@ func (tm *defaultTokenManager) makeHTTPCall(method, url string, payload interfac
 
 	resp, err := tm.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %v", err)
+		return nil, 0, fmt.Errorf("request failed [%s %s]: %v", method, url, err)
 	}
 	defer resp.Body.Close()
 
@@ -399,13 +500,13 @@ func (ws *whatsAppService) sendMessage(phone, message string) error {
 		if formattedPhone != "" {
 			payload["chatId"] = formattedPhone
 		} else {
-			payload["phone"] = phone
+			return fmt.Errorf("invalid phone number format: %s", phone)
 		}
 	}
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %v", err)
+		return fmt.Errorf("failed to marshal WhatsApp payload: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -413,7 +514,7 @@ func (ws *whatsAppService) sendMessage(phone, message string) error {
 
 	req, err := http.NewRequestWithContext(ctx, "POST", ws.endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
+		return fmt.Errorf("failed to create WhatsApp request: %v", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -422,17 +523,17 @@ func (ws *whatsAppService) sendMessage(phone, message string) error {
 
 	resp, err := ws.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %v", err)
+		return fmt.Errorf("WhatsApp request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := readLimitedResponse(resp, MaxResponseSize)
 	if err != nil {
-		return fmt.Errorf("failed to read response: %v", err)
+		return fmt.Errorf("failed to read WhatsApp response: %v", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API error %d: %s", resp.StatusCode, sanitizeForLog(string(respBody)))
+		return fmt.Errorf("WhatsApp API error %d: %s", resp.StatusCode, sanitizeForLog(string(respBody)))
 	}
 
 	log.Printf("WhatsApp API response (%d): %s", resp.StatusCode, sanitizeForLog(string(respBody)))
@@ -481,14 +582,21 @@ func NewABDMManager(config *Config, ctx context.Context) (*ABDMManager, error) {
 		config:      config,
 	}
 
+	rateLimiter := NewRateLimiter(MaxReqPerSecond, ctx)
+
 	notificationSvc := &whatsAppService{
 		apiKey:   config.WhatsAppAPIKey,
 		endpoint: config.WhatsAppEndpoint,
 		client:   httpClient,
 	}
 
-	managerCtx, cancel := context.WithCancel(ctx)
-	rateLimiter := NewRateLimiter(MaxReqPerSecond, managerCtx)
+	resultsDir := fmt.Sprintf("results_%s", time.Now().Format("20060102_150405"))
+	resultWriter, err := NewResultWriter(resultsDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize result writer: %v", err)
+	}
+
+	managerCtx, managerCancel := context.WithCancel(ctx)
 
 	return &ABDMManager{
 		config:          config,
@@ -496,15 +604,45 @@ func NewABDMManager(config *Config, ctx context.Context) (*ABDMManager, error) {
 		httpClient:      httpClient,
 		rateLimiter:     rateLimiter,
 		notificationSvc: notificationSvc,
+		validatedPool:   make([]*ValidatedPatient, 0),
 		originalTokens:  make(map[string]string),
+		resultWriter:    resultWriter,
 		ctx:             managerCtx,
-		cancel:          cancel,
+		cancel:          managerCancel,
 	}, nil
 }
 
 func (am *ABDMManager) Close() {
 	am.cancel()
 	am.rateLimiter.Close()
+	am.resultWriter.Close()
+
+	successCount := am.successCount.Load()
+	totalCount := am.totalCount.Load()
+
+	if totalCount == 0 {
+		log.Println("No executions performed")
+		return
+	}
+
+	successRate := (float64(successCount) / float64(totalCount)) * 100
+
+	executionSummary := map[string]interface{}{
+		"total_patients":    totalCount,
+		"successful":        successCount,
+		"failed":            totalCount - successCount,
+		"success_rate":      fmt.Sprintf("%.1f%%", successRate),
+		"completion_time":   time.Now().Format(time.RFC3339),
+		"validated_pool":    len(am.validatedPool),
+		"total_token_calls": totalCount * BurstCount,
+	}
+
+	if err := am.resultWriter.WriteExecutionSummary(executionSummary); err != nil {
+		log.Printf("Failed to write execution summary: %v", err)
+	}
+
+	log.Printf("Results saved to: %s | Success rate: %.1f%% (%d/%d)",
+		am.resultWriter.baseDir, successRate, successCount, totalCount)
 }
 
 func (am *ABDMManager) initializeSystem() error {
@@ -513,7 +651,7 @@ func (am *ABDMManager) initializeSystem() error {
 	masterToken := am.tokenManager.GetMasterToken()
 	if masterToken.IsExpired() {
 		if err := am.tokenManager.RefreshMasterToken(); err != nil {
-			return fmt.Errorf("failed to refresh master token: %v", err)
+			return fmt.Errorf("failed to refresh master token during initialization: %v", err)
 		}
 	}
 
@@ -539,13 +677,12 @@ func (am *ABDMManager) fetchPatients() ([]Patient, error) {
 		if status == 401 {
 			log.Printf("Token expired, refreshing... (attempt %d/%d)", attempt, MaxRetryAttempts)
 			if refreshErr := am.tokenManager.RefreshMasterToken(); refreshErr != nil {
-				lastErr = fmt.Errorf("token refresh failed: %v", refreshErr)
-				continue
+				return nil, fmt.Errorf("token refresh failed on attempt %d: %v", attempt, refreshErr)
 			}
 			continue
 		}
 
-		lastErr = fmt.Errorf("patient fetch failed: status %d, error: %v", status, err)
+		lastErr = fmt.Errorf("patient fetch failed [GET /profiles/v1/patient]: status %d, error: %v", status, err)
 		if attempt < MaxRetryAttempts {
 			time.Sleep(RetryDelay * time.Duration(attempt))
 		}
@@ -569,7 +706,7 @@ func (am *ABDMManager) makeHTTPCall(method, url string, payload interface{}) ([]
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create request: %v", err)
+		return nil, 0, fmt.Errorf("failed to create request [%s %s]: %v", method, url, err)
 	}
 
 	masterToken := am.tokenManager.GetMasterToken()
@@ -584,7 +721,7 @@ func (am *ABDMManager) makeHTTPCall(method, url string, payload interface{}) ([]
 
 	resp, err := am.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %v", err)
+		return nil, 0, fmt.Errorf("request failed [%s %s]: %v", method, url, err)
 	}
 	defer resp.Body.Close()
 
@@ -652,7 +789,7 @@ func (am *ABDMManager) performOTPAuth(token *Token, healthID string) error {
 
 	initBody, initStatus, err := am.makeHTTPCallWithToken("POST", "https://ndhm.eka.care/v1/auth/init", initPayload, token)
 	if err != nil || initStatus != 200 {
-		return fmt.Errorf("OTP initialization failed: status %d, error: %v", initStatus, err)
+		return fmt.Errorf("OTP initialization failed [POST /v1/auth/init]: status %d, error: %v", initStatus, err)
 	}
 
 	var initResponse map[string]string
@@ -660,7 +797,10 @@ func (am *ABDMManager) performOTPAuth(token *Token, healthID string) error {
 		return fmt.Errorf("failed to parse OTP init response: %v", err)
 	}
 
-	txnID := initResponse["txn_id"]
+	txnID, exists := initResponse["txn_id"]
+	if !exists || txnID == "" {
+		return fmt.Errorf("OTP init response missing txn_id")
+	}
 
 	fmt.Printf("\n🔐 OTP required for patient: %s\n", sanitizeForDisplay(healthID))
 	fmt.Print("Enter the OTP you received: ")
@@ -697,7 +837,7 @@ func (am *ABDMManager) performOTPAuth(token *Token, healthID string) error {
 
 	_, verifyStatus, err := am.makeHTTPCallWithToken("POST", "https://ndhm.eka.care/v1/auth/verify", verifyPayload, token)
 	if err != nil || verifyStatus != 200 {
-		return fmt.Errorf("OTP verification failed: status %d, error: %v", verifyStatus, err)
+		return fmt.Errorf("OTP verification failed [POST /v1/auth/verify]: status %d, error: %v", verifyStatus, err)
 	}
 
 	log.Printf("OTP verification successful for %s", sanitizeForLog(healthID))
@@ -719,7 +859,7 @@ func (am *ABDMManager) makeHTTPCallWithToken(method, url string, payload interfa
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create request: %v", err)
+		return nil, 0, fmt.Errorf("failed to create request [%s %s]: %v", method, url, err)
 	}
 
 	headers := buildBaseHeaders()
@@ -733,7 +873,7 @@ func (am *ABDMManager) makeHTTPCallWithToken(method, url string, payload interfa
 
 	resp, err := am.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %v", err)
+		return nil, 0, fmt.Errorf("request failed [%s %s]: %v", method, url, err)
 	}
 	defer resp.Body.Close()
 
@@ -746,7 +886,7 @@ func (am *ABDMManager) executeWithFreshTokens(targetTime time.Time) error {
 		return fmt.Errorf("no validated patients to execute")
 	}
 
-	isImmediate := targetTime.Before(time.Now().Add(10 * time.Second))
+	isImmediate := targetTime.Before(time.Now().Add(30 * time.Second))
 
 	if !isImmediate {
 		log.Printf("Target execution time: %s", targetTime.Format("15:04:05"))
@@ -829,9 +969,15 @@ func (am *ABDMManager) generateFreshTokensConcurrent() (map[string]*Token, error
 func (am *ABDMManager) executeConcurrentBursts(tokenMap map[string]*Token) error {
 	log.Printf("Starting concurrent execution for %d patients at %s", len(tokenMap), time.Now().Format("15:04:05.000"))
 
-	var wg sync.WaitGroup
-	results := make(chan *ExecutionResult, len(am.validatedPool))
-	notifications := make(chan *WhatsAppNotification, len(am.validatedPool))
+	type executionResult struct {
+		patient       Patient
+		successCount  int
+		tokenNumber   string
+		goldenAttempt int
+	}
+
+	results := make(chan executionResult, len(am.validatedPool))
+	var burstWg sync.WaitGroup
 
 	for _, validated := range am.validatedPool {
 		token, exists := tokenMap[validated.Patient.OID]
@@ -840,61 +986,66 @@ func (am *ABDMManager) executeConcurrentBursts(tokenMap map[string]*Token) error
 			continue
 		}
 
-		wg.Add(1)
+		burstWg.Add(1)
 		go func(patient Patient, execToken *Token) {
-			defer wg.Done()
+			defer burstWg.Done()
 
-			burstResults := am.performBurstExecution(patient, execToken)
+			am.totalCount.Add(1)
 
-			results <- &ExecutionResult{
-				HealthID: patient.PrimaryHealthID(),
-				Results:  burstResults,
-				Summary:  am.createSummary(patient, burstResults),
+			successCount, tokenNumber, goldenAttempt := am.performBurstExecutionWithImmediateNotification(patient, execToken)
+
+			results <- executionResult{
+				patient:       patient,
+				successCount:  successCount,
+				tokenNumber:   tokenNumber,
+				goldenAttempt: goldenAttempt,
 			}
-
-			successCount := 0
-			var goldenResponse json.RawMessage
-			for _, r := range burstResults {
-				if r.Status == "golden" || r.Status == "valid" {
-					successCount++
-					if r.Status == "golden" {
-						goldenResponse = r.Response
-					}
-				}
-			}
-
-			tokenNumber := extractTokenNumber(goldenResponse)
-			notifications <- &WhatsAppNotification{
-				Patient:        patient,
-				GoldenResponse: goldenResponse,
-				HasSuccess:     successCount > 0,
-				TokenNumber:    tokenNumber,
-			}
-
-			if tokenNumber != "" {
-				am.tokenMutex.Lock()
-				am.originalTokens[patient.PrimaryHealthID()] = tokenNumber
-				am.tokenMutex.Unlock()
-			}
-
-			log.Printf("Completed %s: %d/%d successful", sanitizeForLog(patient.FLN), successCount, len(burstResults))
 		}(validated.Patient, token)
 	}
 
 	go func() {
-		wg.Wait()
+		burstWg.Wait()
 		close(results)
-		close(notifications)
 	}()
 
-	go am.saveExecutionResults(results)
+	for result := range results {
+		patientDir, err := am.resultWriter.WritePatientDir(result.patient.PrimaryHealthID())
+		if err != nil {
+			log.Printf("Failed to create patient directory for %s: %v", sanitizeForLog(result.patient.FLN), err)
+			continue
+		}
 
-	am.sendWhatsAppNotificationsSequential(notifications)
+		summary := PatientSummary{
+			Patient:       result.patient,
+			TotalAttempts: BurstCount,
+			Successful:    result.successCount,
+			ValidationOK:  result.successCount > 0,
+			TokenNumber:   result.tokenNumber,
+			ExecutionTime: time.Now().Format(time.RFC3339),
+			GoldenAttempt: result.goldenAttempt,
+		}
+
+		if err := am.resultWriter.WriteSummary(patientDir, summary); err != nil {
+			log.Printf("Failed to save summary for %s: %v", sanitizeForLog(result.patient.FLN), err)
+		}
+
+		if result.successCount > 0 {
+			am.successCount.Add(1)
+		}
+
+		if result.tokenNumber != "" {
+			am.tokenMutex.Lock()
+			am.originalTokens[result.patient.PrimaryHealthID()] = result.tokenNumber
+			am.tokenMutex.Unlock()
+		}
+
+		log.Printf("Completed %s: %d/%d successful", sanitizeForLog(result.patient.FLN), result.successCount, BurstCount)
+	}
 
 	return am.runVerificationLoop(tokenMap)
 }
 
-func (am *ABDMManager) performBurstExecution(patient Patient, token *Token) []BurstResult {
+func (am *ABDMManager) performBurstExecutionWithImmediateNotification(patient Patient, token *Token) (int, string, int) {
 	payload := map[string]interface{}{
 		"location":  map[string]interface{}{},
 		"hip_id":    am.config.HipID,
@@ -902,9 +1053,11 @@ func (am *ABDMManager) performBurstExecution(patient Patient, token *Token) []Bu
 		"health_id": patient.PrimaryHealthID(),
 	}
 
-	results := make([]BurstResult, 0, BurstCount)
-	var goldenResponse json.RawMessage
-	goldenFound := false
+	successCount := 0
+	var goldenToken string
+	var goldenResponseBytes []byte
+	goldenAttempt := 0
+	notificationSent := false
 
 	for i := 0; i < BurstCount; i++ {
 		select {
@@ -917,31 +1070,29 @@ func (am *ABDMManager) performBurstExecution(patient Patient, token *Token) []Bu
 		response, status, err := am.makeHTTPCallWithToken("POST", "https://ndhm.eka.care/v2/hip/profile/share", payload, token)
 		elapsed := time.Since(start)
 
-		result := BurstResult{
-			Attempt:      i + 1,
-			Timestamp:    time.Now().Format("2006-01-02T15:04:05.000Z07:00"),
-			ResponseTime: elapsed.Milliseconds(),
-			Status:       "pending",
+		if err != nil || status != 200 {
+			continue
 		}
 
-		if err != nil || status != 200 {
-			result.Status = "error"
-			result.Response = json.RawMessage(fmt.Sprintf(`{"error": "%s", "status": %d}`, sanitizeForJSON(err.Error()), status))
-		} else {
-			result.Response = response
+		if i >= 2 && goldenToken == "" {
+			tokenNum, hasValidToken := extractAndValidateTokenNumber(response)
+			if hasValidToken {
+				goldenToken = tokenNum
+				goldenResponseBytes = response
+				goldenAttempt = i + 1
+				successCount++
+				log.Printf("Golden response detected at attempt %d for %s: token %s", i+1, sanitizeForLog(patient.FLN), tokenNum)
 
-			if i >= 2 && !goldenFound && bytes.Contains(response, []byte(`"token_number"`)) {
-				goldenResponse = response
-				goldenFound = true
-				result.Status = "golden"
-			} else if goldenFound && bytes.Equal(response, goldenResponse) {
-				result.Status = "valid"
-			} else if goldenFound {
-				result.Status = "mismatch"
+				if !notificationSent {
+					go am.sendImmediateNotification(patient, tokenNum, true)
+					notificationSent = true
+				}
+			}
+		} else if goldenToken != "" {
+			if areJSONResponsesBytesEqual(response, goldenResponseBytes) {
+				successCount++
 			}
 		}
-
-		results = append(results, result)
 
 		if i < BurstCount-1 {
 			if sleepTime := TargetInterval - elapsed; sleepTime > 0 {
@@ -954,92 +1105,44 @@ func (am *ABDMManager) performBurstExecution(patient Patient, token *Token) []Bu
 		}
 	}
 
-	return results
-}
-
-func (am *ABDMManager) createSummary(patient Patient, results []BurstResult) map[string]interface{} {
-	successCount := 0
-	var goldenResponse json.RawMessage
-
-	for _, result := range results {
-		if result.Status == "golden" || result.Status == "valid" {
-			successCount++
-			if result.Status == "golden" {
-				goldenResponse = result.Response
-			}
-		}
+	if !notificationSent && successCount == 0 {
+		go am.sendImmediateNotification(patient, "", false)
 	}
 
-	return map[string]interface{}{
-		"patient":            patient,
-		"total_attempts":     len(results),
-		"successful":         successCount,
-		"validation_success": successCount > 0,
-		"golden_response":    goldenResponse,
-		"execution_time":     time.Now().Format(time.RFC3339),
-	}
+	return successCount, goldenToken, goldenAttempt
 }
 
-func (am *ABDMManager) sendWhatsAppNotificationsSequential(notifications chan *WhatsAppNotification) {
+func (am *ABDMManager) sendImmediateNotification(patient Patient, tokenNumber string, hasSuccess bool) {
 	if am.config.WhatsAppAPIKey == "" || am.config.WhatsAppEndpoint == "" {
-		log.Println("WhatsApp configuration missing, skipping all notifications")
-		for range notifications {
-		}
 		return
 	}
 
-	log.Println("Starting sequential WhatsApp notifications...")
+	var message, phone string
 
-	notificationCount := 0
-	for notification := range notifications {
-		if am.ctx.Err() != nil {
-			log.Println("Context cancelled, stopping notifications")
-			break
-		}
-
-		notificationCount++
-
-		var message, phone string
-
-		if notification.HasSuccess && notification.GoldenResponse != nil {
-			if notification.TokenNumber != "" {
-				message = fmt.Sprintf("✅ SUCCESS - %s\nToken Number: %s\nTime: %s",
-					sanitizeForDisplay(notification.Patient.FLN), notification.TokenNumber, time.Now().Format("15:04:05"))
-				phone = am.config.SuccessPhone
-				log.Printf("Sending success notification for %s with token: %s", sanitizeForLog(notification.Patient.FLN), notification.TokenNumber)
-			} else {
-				message = fmt.Sprintf("⚠️ PARTIAL SUCCESS - %s\nResponse received but no token number found\nTime: %s",
-					sanitizeForDisplay(notification.Patient.FLN), time.Now().Format("15:04:05"))
-				phone = am.config.ErrorPhone
-				log.Printf("Sending partial success notification for %s", sanitizeForLog(notification.Patient.FLN))
-			}
+	if hasSuccess {
+		if tokenNumber != "" {
+			message = fmt.Sprintf("✅ SUCCESS - %s\nToken Number: %s\nTime: %s",
+				sanitizeForDisplay(patient.FLN), tokenNumber, time.Now().Format("15:04:05"))
+			phone = am.config.SuccessPhone
+			log.Printf("Sending immediate success notification for %s with token: %s", sanitizeForLog(patient.FLN), tokenNumber)
 		} else {
-			message = fmt.Sprintf("❌ FAILED - %s\nNo successful response received\nTime: %s",
-				sanitizeForDisplay(notification.Patient.FLN), time.Now().Format("15:04:05"))
+			message = fmt.Sprintf("⚠️ PARTIAL SUCCESS - %s\nResponse received but no token number found\nTime: %s",
+				sanitizeForDisplay(patient.FLN), time.Now().Format("15:04:05"))
 			phone = am.config.ErrorPhone
-			log.Printf("Sending failure notification for %s", sanitizeForLog(notification.Patient.FLN))
+			log.Printf("Sending immediate partial success notification for %s", sanitizeForLog(patient.FLN))
 		}
-
-		if phone != "" {
-			if err := am.notificationSvc.SendNotification(phone, message); err != nil {
-				log.Printf("WhatsApp notification failed for %s: %v", sanitizeForLog(notification.Patient.FLN), err)
-			} else {
-				log.Printf("WhatsApp notification sent successfully for %s", sanitizeForLog(notification.Patient.FLN))
-			}
-		} else {
-			log.Printf("No phone number configured for notification type")
-		}
-
-		if notificationCount > 1 {
-			select {
-			case <-time.After(WhatsAppDelay):
-			case <-am.ctx.Done():
-				return
-			}
-		}
+	} else {
+		message = fmt.Sprintf("❌ FAILED - %s\nNo successful response received\nTime: %s",
+			sanitizeForDisplay(patient.FLN), time.Now().Format("15:04:05"))
+		phone = am.config.ErrorPhone
+		log.Printf("Sending immediate failure notification for %s", sanitizeForLog(patient.FLN))
 	}
 
-	log.Printf("Completed sending %d WhatsApp notifications", notificationCount)
+	if phone != "" {
+		if err := am.notificationSvc.SendNotification(phone, message); err != nil {
+			log.Printf("Failed to send immediate notification for %s: %v", sanitizeForLog(patient.FLN), err)
+		}
+	}
 }
 
 func (am *ABDMManager) runVerificationLoop(tokenMap map[string]*Token) error {
@@ -1056,16 +1159,16 @@ func (am *ABDMManager) runVerificationLoop(tokenMap map[string]*Token) error {
 
 	loc, err := time.LoadLocation(am.config.Timezone)
 	if err != nil {
-		log.Printf("Failed to load timezone %s, using UTC", am.config.Timezone)
-		loc = time.UTC
+		return fmt.Errorf("failed to load timezone %s: %v", am.config.Timezone, err)
 	}
 
 	now := time.Now().In(loc)
 
+verificationLoop:
 	for hour := APIActiveHour; hour <= VerificationEndHour; hour++ {
 		for _, minute := range verificationMinutes {
 			if hour == VerificationEndHour && minute > 0 {
-				break
+				break verificationLoop
 			}
 
 			targetTime := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, loc)
@@ -1122,7 +1225,10 @@ func (am *ABDMManager) performVerificationCheck(tokenMap map[string]*Token) ([]V
 			continue
 		}
 
+		am.tokenMapMutex.RLock()
 		token, tokenExists := tokenMap[validated.Patient.OID]
+		am.tokenMapMutex.RUnlock()
+
 		if !tokenExists {
 			log.Printf("No token available for verification of %s", sanitizeForLog(validated.Patient.FLN))
 			continue
@@ -1135,7 +1241,9 @@ func (am *ABDMManager) performVerificationCheck(tokenMap map[string]*Token) ([]V
 				continue
 			}
 			token = refreshedToken
+			am.tokenMapMutex.Lock()
 			tokenMap[validated.Patient.OID] = refreshedToken
+			am.tokenMapMutex.Unlock()
 		}
 
 		currentToken, hasSuccess := am.performSingleVerificationBurst(validated.Patient, token)
@@ -1224,66 +1332,6 @@ func (am *ABDMManager) sendVerificationNotifications(changes []VerificationResul
 			}
 		}
 	}
-}
-
-func (am *ABDMManager) saveExecutionResults(results chan *ExecutionResult) {
-	baseDir := filepath.Join("results_flow", time.Now().Format("02-01-2006_150405"))
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		log.Printf("Failed to create results directory: %v", err)
-		return
-	}
-
-	successCount := 0
-	totalCount := 0
-
-	for result := range results {
-		totalCount++
-
-		healthIDSafe := sanitizeFilename(strings.Split(result.HealthID, "@")[0])
-		patientDir := filepath.Join(baseDir, healthIDSafe)
-		if err := os.MkdirAll(patientDir, 0755); err != nil {
-			log.Printf("Failed to create patient directory: %v", err)
-			continue
-		}
-
-		summaryData, ok := result.Summary.(map[string]interface{})
-		if ok && summaryData["validation_success"].(bool) {
-			successCount++
-		}
-
-		if err := saveJSON(filepath.Join(patientDir, "summary.json"), result.Summary); err != nil {
-			log.Printf("Failed to save summary: %v", err)
-		}
-
-		for _, burst := range result.Results {
-			if burst.Status == "error" || burst.Status == "mismatch" {
-				path := filepath.Join(patientDir, fmt.Sprintf("attempt_%03d.json", burst.Attempt))
-				if err := saveJSON(path, burst); err != nil {
-					log.Printf("Failed to save burst result: %v", err)
-				}
-			}
-		}
-	}
-
-	var successRate float64
-	if totalCount > 0 {
-		successRate = float64(successCount) / float64(totalCount) * 100
-	}
-
-	executionSummary := map[string]interface{}{
-		"execution_time": time.Now().Format(time.RFC3339),
-		"total_patients": totalCount,
-		"success_count":  successCount,
-		"failed_count":   totalCount - successCount,
-		"success_rate":   successRate,
-	}
-
-	if err := saveJSON(filepath.Join(baseDir, "execution_summary.json"), executionSummary); err != nil {
-		log.Printf("Failed to save execution summary: %v", err)
-	}
-
-	log.Printf("Results saved to: %s | Success rate: %.1f%% (%d/%d)",
-		baseDir, successRate, successCount, totalCount)
 }
 
 func main() {
@@ -1398,8 +1446,7 @@ func parseJWTExpiry(token string) time.Time {
 func calculateExecutionTime(targetDate, timezone string) (time.Time, error) {
 	loc, err := time.LoadLocation(timezone)
 	if err != nil {
-		log.Printf("Failed to load timezone %s, using UTC", timezone)
-		loc = time.UTC
+		return time.Time{}, fmt.Errorf("failed to load timezone %s: %v", timezone, err)
 	}
 
 	now := time.Now().In(loc)
@@ -1478,20 +1525,20 @@ func selectPatients(patients []Patient) ([]Patient, error) {
 	return selected, nil
 }
 
-func saveJSON(path string, data interface{}) error {
+func writeJSONFile(path string, data interface{}) error {
 	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %v", err)
 	}
 
 	if err := os.WriteFile(path, jsonData, 0644); err != nil {
-		return fmt.Errorf("failed to write file: %v", err)
+		return fmt.Errorf("failed to write file %s: %v", path, err)
 	}
 
 	return nil
 }
 
-func extractTokenNumber(jsonData json.RawMessage) string {
+func extractTokenNumber(jsonData []byte) string {
 	if jsonData == nil {
 		return ""
 	}
@@ -1514,6 +1561,104 @@ func extractTokenNumber(jsonData json.RawMessage) string {
 	return ""
 }
 
+func extractAndValidateTokenNumber(jsonData []byte) (string, bool) {
+	if jsonData == nil {
+		return "", false
+	}
+
+	var responseMap map[string]interface{}
+	if err := json.Unmarshal(jsonData, &responseMap); err != nil {
+		return "", false
+	}
+
+	if tokenNumber, ok := responseMap["token_number"].(string); ok && tokenNumber != "" {
+		return tokenNumber, true
+	}
+
+	if data, ok := responseMap["data"].(map[string]interface{}); ok {
+		if tokenNumber, ok := data["token_number"].(string); ok && tokenNumber != "" {
+			return tokenNumber, true
+		}
+	}
+
+	return "", false
+}
+
+func areJSONResponsesBytesEqual(resp1, resp2 []byte) bool {
+	if resp1 == nil || resp2 == nil {
+		return false
+	}
+
+	var map1, map2 map[string]interface{}
+	if err := json.Unmarshal(resp1, &map1); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(resp2, &map2); err != nil {
+		return false
+	}
+
+	return jsonMapsEqual(map1, map2)
+}
+
+func jsonMapsEqual(m1, m2 map[string]interface{}) bool {
+	if len(m1) != len(m2) {
+		return false
+	}
+
+	for k, v1 := range m1 {
+		v2, exists := m2[k]
+		if !exists {
+			return false
+		}
+
+		switch v1Type := v1.(type) {
+		case map[string]interface{}:
+			v2Map, ok := v2.(map[string]interface{})
+			if !ok || !jsonMapsEqual(v1Type, v2Map) {
+				return false
+			}
+		case []interface{}:
+			v2Slice, ok := v2.([]interface{})
+			if !ok || !jsonSlicesEqual(v1Type, v2Slice) {
+				return false
+			}
+		default:
+			if fmt.Sprint(v1) != fmt.Sprint(v2) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func jsonSlicesEqual(s1, s2 []interface{}) bool {
+	if len(s1) != len(s2) {
+		return false
+	}
+
+	for i := range s1 {
+		switch v1 := s1[i].(type) {
+		case map[string]interface{}:
+			v2, ok := s2[i].(map[string]interface{})
+			if !ok || !jsonMapsEqual(v1, v2) {
+				return false
+			}
+		case []interface{}:
+			v2, ok := s2[i].([]interface{})
+			if !ok || !jsonSlicesEqual(v1, v2) {
+				return false
+			}
+		default:
+			if fmt.Sprint(s1[i]) != fmt.Sprint(s2[i]) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 func formatPhoneNumber(phone string) string {
 	if phone == "" {
 		return ""
@@ -1530,11 +1675,11 @@ func formatPhoneNumber(phone string) string {
 		cleanPhone = cleanPhone[1:]
 	}
 
-	if len(cleanPhone) >= 10 {
-		return cleanPhone + "@c.us"
+	if len(cleanPhone) < MinPhoneDigits || len(cleanPhone) > MaxPhoneDigits {
+		return ""
 	}
 
-	return ""
+	return cleanPhone + "@c.us"
 }
 
 func buildBaseHeaders() map[string]string {
@@ -1584,10 +1729,6 @@ func sanitizeForLog(input string) string {
 
 func sanitizeForDisplay(input string) string {
 	return strings.ReplaceAll(input, "\n", " ")
-}
-
-func sanitizeForJSON(input string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(input, "\"", "'"), "\n", " ")
 }
 
 func sanitizeFilename(input string) string {
